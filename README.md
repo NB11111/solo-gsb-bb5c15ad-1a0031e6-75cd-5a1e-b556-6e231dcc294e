@@ -11,7 +11,9 @@
 **播放变速规划**接口，把连续同一说话人的词合并为语速块，在目标最长
 播放时长约束下选出总变速代价最小的语速方案，以及**叠话统计报告**接口，
 对允许乱序与交叠的词序列统计各说话人发声覆盖、至少两人同时发声的
-叠话区间与各说话人对的总重叠毫秒数。
+叠话区间与各说话人对的总重叠毫秒数，以及**修订稿重对齐逐词时间**接口，
+按 `(text, speaker)` 在原稿与修订稿间求最长保序匹配，命中词沿用原时间、
+未命中修订词在相邻锚点间隔内均分时间。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -32,6 +34,7 @@ docker compose up --build
 - 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
 - 播放变速规划接口：`POST http://localhost:8000/playback-plan`
 - 叠话统计报告接口：`POST http://localhost:8000/crosstalk-report`
+- 修订稿重对齐逐词时间接口：`POST http://localhost:8000/transcript-retime`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -870,13 +873,140 @@ curl -s http://localhost:8000/crosstalk-report \
   -d '{"words":[{"start_ms":1000,"end_ms":3000,"text":"没错","speaker":"A"},{"start_ms":0,"end_ms":2000,"text":"我觉得","speaker":"A"},{"start_ms":1500,"end_ms":2500,"text":"对对对","speaker":"B"},{"start_ms":4000,"end_ms":5000,"text":"下期再见","speaker":"B"}]}'
 ```
 
+## 修订稿重对齐逐词时间：`POST /transcript-retime`
+
+人工修订后的词序列（只给 `text`/`speaker`、没有时间）需要重新挂回原稿时间轴：
+按整词 `(text, speaker)` 在原稿 `words` 与修订稿 `revisions` 之间求**数量最多的
+保序匹配**（最长公共子序列 LCS，不要求连续），命中词直接沿用所匹配原稿词的原
+`start_ms`/`end_ms`；未命中的**连续修订词**在相邻锚点间隔内**均分**时间。
+`words` 与其他接口一样按时间排列且互不重叠（沿用同一套 422 校验），两侧各不超过
+**300** 词。
+
+服务地址：`POST http://localhost:8000/transcript-retime`
+
+```json
+{
+  "words": [
+    {"start_ms": 1000, "end_ms": 1500, "text": "大家好", "speaker": "A"},
+    {"start_ms": 2000, "end_ms": 2500, "text": "今天",   "speaker": "A"},
+    {"start_ms": 3000, "end_ms": 3500, "text": "再见",   "speaker": "B"},
+    {"start_ms": 4000, "end_ms": 4500, "text": "拜拜",   "speaker": "B"}
+  ],
+  "revisions": [
+    {"text": "嗯",   "speaker": "A"},
+    {"text": "今天", "speaker": "A"},
+    {"text": "那个", "speaker": "A"},
+    {"text": "再见", "speaker": "B"},
+    {"text": "拜拜", "speaker": "B"}
+  ]
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `revisions` | 非空数组，1～300 项 | 修订词序列，每项只含非空 `text` 与非空 `speaker`（无时间字段） |
+
+> `words` 同样为 1～300 个；任一侧为空或超过 300、修订项缺 `text`/`speaker`
+> 或为空字符串均返回 422（`invalid_request`）。
+
+### 对齐规则
+
+1. **匹配单位**：整词 `(text, speaker)`——文本与说话人都相同才算命中
+   （同一文本但说话人不同不匹配），单词文本不拆分；
+2. **目标一（最多）**：在两侧之间求索引严格递増的保序匹配，使命中词对数量最大
+   （即 LCS 长度）；
+3. **目标二（同分裁决）**：数量相同时取**匹配索引对序列**
+   `((原稿 i, 修订 j), ...)` **字典序最小**者——逐对比较，先比原稿索引 `i`、
+   `i` 相同再比修订索引 `j`；
+4. **命中词**：保留所匹配原稿词的原 `start_ms` / `end_ms`；
+5. **未命中连续词均分**：每段夹在相邻命中锚点之间的未命中修订词（一个 run）
+   均分锚点间隔。`c` 个词均分长度 `span`：每词时长 `span // c` 毫秒，余数
+   `span % c` **从前往后**分配（前若干词各多 1 毫秒），词间端点相接、末词恰好
+   结束于右锚点；
+6. **虚拟锚点**：第一个命中词之前的 run，左锚点取**原稿首词 `start_ms`**、
+   右锚点取首个命中词的 `start_ms`；最后一个命中词之后的 run，左锚点取末命中词
+   的 `end_ms`、右锚点取**原稿末词 `end_ms`**；
+7. **无匹配**：没有任何命中时，全部修订词在
+   `[原稿首词 start_ms, 原稿末词 end_ms)` 全长内均分；
+8. 某 run 的可用间隔不足每词 1 毫秒（`span < 词数`）时返回 **422**
+   （`infeasible_retime`），并在错误体中指出该 run 的**修订词范围**。
+
+### 响应示例（200）
+
+```json
+{
+  "words": [
+    {"index": 0, "start_ms": 1000, "end_ms": 2000, "text": "嗯",   "speaker": "A", "source_word_index": null},
+    {"index": 1, "start_ms": 2000, "end_ms": 2500, "text": "今天", "speaker": "A", "source_word_index": 1},
+    {"index": 2, "start_ms": 2500, "end_ms": 3000, "text": "那个", "speaker": "A", "source_word_index": null},
+    {"index": 3, "start_ms": 3000, "end_ms": 3500, "text": "再见", "speaker": "B", "source_word_index": 2},
+    {"index": 4, "start_ms": 4000, "end_ms": 4500, "text": "拜拜", "speaker": "B", "source_word_index": 3}
+  ],
+  "matched_count": 3
+}
+```
+
+> `words` 按修订顺序返回完整逐词时间；`index` 为修订词序号（0-based）。
+> `source_word_index` 为命中原稿词序号（0-based），未命中为 `null`。
+> 上例“今天/再见/拜拜”三命中并沿用原时间；“嗯”是首个命中词之前的 run，在
+> 虚拟锚点 `[首词 start=1000, “今天” start=2000)` 内占满 1000ms；“那个”在
+> `[“今天” end=2500, “再见” start=3000)` 内占 500ms；末命中词即原稿末词，
+> 其后没有 run。`matched_count` 为命中词对数。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/transcript-retime \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":1000,"end_ms":1500,"text":"大家好","speaker":"A"},{"start_ms":2000,"end_ms":2500,"text":"今天","speaker":"A"},{"start_ms":3000,"end_ms":3500,"text":"再见","speaker":"B"},{"start_ms":4000,"end_ms":4500,"text":"拜拜","speaker":"B"}],"revisions":[{"text":"嗯","speaker":"A"},{"text":"今天","speaker":"A"},{"text":"那个","speaker":"A"},{"text":"再见","speaker":"B"},{"text":"拜拜","speaker":"B"}]}'
+```
+
+### 无匹配时均分全长
+
+两侧没有任何 `(text, speaker)` 相同的词时，全部修订词在原稿全长内均分。
+例如原稿全长 `[0, 2000)`、3 个修订词：`span=2000, base=666, rem=2`，余数
+从前往后分，得到 667、667、666 毫秒：
+
+```json
+{
+  "words": [
+    {"index": 0, "start_ms": 0,    "end_ms": 667,  "text": "丙", "speaker": "A", "source_word_index": null},
+    {"index": 1, "start_ms": 667,  "end_ms": 1334, "text": "丁", "speaker": "A", "source_word_index": null},
+    {"index": 2, "start_ms": 1334, "end_ms": 2000, "text": "戊", "speaker": "A", "source_word_index": null}
+  ],
+  "matched_count": 0
+}
+```
+
+### 锚点间隔不足
+
+某段连续未命中修订词的可用间隔不足每词至少 1 毫秒时，返回 422 并指出修订词
+范围（0-based、含端点）。下例两命中词“甲”(`end=500`)、“乙”(`start=501`)
+之间只有 1ms，却要塞入 2 个修订词（需 2ms）：
+
+```json
+{
+  "error": {
+    "code": "infeasible_retime",
+    "message": "修订词第 1～2 个（共 2 个）的相邻锚点间隔仅 1 毫秒，不足每词至少 1 毫秒（需 2 毫秒）",
+    "revision_start_index": 1,
+    "revision_end_index": 2,
+    "revision_word_count": 2,
+    "available_ms": 1,
+    "required_ms": 2
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负；`/transcript-retime` 的 `words`/`revisions` 为空或超过 300 个、修订项缺 `text`/`speaker` 或为空字符串） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 中 `word_index` 为输入序） | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -892,6 +1022,7 @@ curl -s http://localhost:8000/crosstalk-report \
 | `infeasible_trailer_plan` | 不存在满足全部约束的预告片片段组合 | `candidate_count`、`budget_ms` |
 | `too_many_blocks` | 同一说话人连续块数超过 20 | `block_count` |
 | `infeasible_playback_plan` | 不存在满足目标最长播放时长约束的变速方案 | `block_count`、`max_duration_ms` |
+| `infeasible_retime` | `/transcript-retime` 某段连续未命中修订词的相邻锚点间隔不足每词 1 毫秒 | `revision_start_index`、`revision_end_index`、`revision_word_count`、`available_ms`、`required_ms` |
 
 ### 无可行分段
 
@@ -1007,6 +1138,19 @@ E 为不同边界时刻数 ≤ 2n、M 为输出段数 ≤ E、k 为活跃说话�
 否则另起新段；说话人对重叠按输出段展开——每段时长计入其活跃集合的
 全部两人组合（三人同时发声的时长分别计入三对）。
 
+修订稿重对齐逐词时间（`transcript_retime.py`）为 LCS 后向 DP + 贪心重建，
+**O(n·m) 时间/空间**（n、m ≤ 300）。以 `(text, speaker)` 为符号，
+`lcs[i][j]` 表示原稿后缀 `[i,n)` 与修订后缀 `[j,m)` 的最长保序匹配长度，
+按标准后向递推填充；重建时在当前子矩形 `[i0,n)×[j0,m)` 内按原稿索引 `i`
+升序、同 `i` 按修订索引 `j` 升序，取第一个满足
+`1 + lcs[i+1][j+1] == lcs[i0][j0]` 的相同符号格——该条件保证“选此对 +
+其后缀最优”恰能补满当前最优长度，而枚举顺序先 `i` 后 `j` 即取索引对字典序
+最小的可行首对，归纳可得整条匹配索引对序列字典序最小；每次取对后子矩形
+严格缩小，累计扫描不超过 n·m 格。命中词沿用原时间；未命中 run 按
+`span // c` 均分、余数 `span % c` 从前往后逐个加 1 毫秒，首尾 run 用原稿
+首词 `start_ms`、末词 `end_ms` 作虚拟锚点，无命中时整段均分全长；
+任一 run `span < c` 即返回 422 并给出该 run 的修订词闭区间。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -1037,6 +1181,7 @@ app/
   trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
   playback_plan.py      # 播放变速规划（纯标准库，复用同一套输入校验）
   crosstalk_report.py   # 叠话统计报告（纯标准库，允许乱序与交叠，仅校验词内时间）
+  transcript_retime.py  # 修订稿重对齐逐词时间（纯标准库，LCS 匹配 + 锚点间隔均分）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -1049,6 +1194,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_trailer_plan.py
   test_playback_plan.py
   test_crosstalk_report.py
+  test_transcript_retime.py
   test_differential.py
   test_api.py
 Dockerfile

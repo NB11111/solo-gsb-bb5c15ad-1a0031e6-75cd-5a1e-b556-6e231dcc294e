@@ -1039,5 +1039,164 @@ class CrosstalkReportApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class TranscriptRetimeApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 1000, "end_ms": 1500, "text": "大家好", "speaker": "A"},
+        {"start_ms": 2000, "end_ms": 2500, "text": "今天", "speaker": "A"},
+        {"start_ms": 3000, "end_ms": 3500, "text": "再见", "speaker": "B"},
+        {"start_ms": 4000, "end_ms": 4500, "text": "拜拜", "speaker": "B"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "revisions": [
+            {"text": "嗯", "speaker": "A"},
+            {"text": "今天", "speaker": "A"},
+            {"text": "那个", "speaker": "A"},
+            {"text": "再见", "speaker": "B"},
+            {"text": "拜拜", "speaker": "B"},
+        ]}
+        payload.update(overrides)
+        return self.client.post("/transcript-retime", json=payload)
+
+    def test_basic_retime(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        # 命中“今天”(w1) 与“再见”(w2)、“拜拜”(w3) 中——LCS：今天/再见/拜拜 三命中
+        self.assertEqual(data["matched_count"], 3)
+        self.assertEqual(
+            data["words"],
+            [
+                {"index": 0, "start_ms": 1000, "end_ms": 2000, "text": "嗯",
+                 "speaker": "A", "source_word_index": None},
+                {"index": 1, "start_ms": 2000, "end_ms": 2500, "text": "今天",
+                 "speaker": "A", "source_word_index": 1},
+                {"index": 2, "start_ms": 2500, "end_ms": 3000, "text": "那个",
+                 "speaker": "A", "source_word_index": None},
+                {"index": 3, "start_ms": 3000, "end_ms": 3500, "text": "再见",
+                 "speaker": "B", "source_word_index": 2},
+                {"index": 4, "start_ms": 4000, "end_ms": 4500, "text": "拜拜",
+                 "speaker": "B", "source_word_index": 3},
+            ],
+        )
+
+    def test_no_match_even_split(self):
+        resp = self.post(revisions=[
+            {"text": "丙", "speaker": "A"},
+            {"text": "丁", "speaker": "A"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["matched_count"], 0)
+        # 全长 [1000,4500) span=3500，2 词：1750 各
+        self.assertEqual(
+            [(w["start_ms"], w["end_ms"], w["source_word_index"]) for w in data["words"]],
+            [(1000, 2750, None), (2750, 4500, None)],
+        )
+
+    def test_speaker_must_match(self):
+        # “今天”说话人改成 B，与原稿 A 的“今天”不匹配
+        resp = self.post(revisions=[
+            {"text": "今天", "speaker": "B"},
+            {"text": "再见", "speaker": "B"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        words = resp.json()["words"]
+        self.assertEqual(resp.json()["matched_count"], 1)
+        self.assertEqual([w["source_word_index"] for w in words], [None, 2])
+
+    def test_lexicographically_smallest_pairs(self):
+        # A=[b@0,a@100,a@200]（前置无 room，故让首词带前置间隔）
+        words = [
+            {"start_ms": 0, "end_ms": 50, "text": "x", "speaker": "A"},
+            {"start_ms": 100, "end_ms": 150, "text": "b", "speaker": "A"},
+            {"start_ms": 200, "end_ms": 250, "text": "a", "speaker": "A"},
+        ]
+        revisions = [
+            {"text": "a", "speaker": "A"},
+            {"text": "b", "speaker": "A"},
+            {"text": "a", "speaker": "A"},
+        ]
+        resp = self.client.post(
+            "/transcript-retime", json={"words": words, "revisions": revisions}
+        )
+        self.assertEqual(resp.status_code, 200)
+        out = resp.json()["words"]
+        # 长度 2：索引对序列取 (1,1)(2,2)（首对 i 最小），修订 0 前置均分 [0,100)
+        self.assertEqual([w["source_word_index"] for w in out], [None, 1, 2])
+        self.assertEqual((out[0]["start_ms"], out[0]["end_ms"]), (0, 100))
+
+    def test_insufficient_gap_returns_422_with_range(self):
+        words = [
+            {"start_ms": 0, "end_ms": 500, "text": "甲", "speaker": "A"},
+            {"start_ms": 501, "end_ms": 1000, "text": "乙", "speaker": "A"},
+        ]
+        revisions = [
+            {"text": "甲", "speaker": "A"},
+            {"text": "x", "speaker": "A"},
+            {"text": "y", "speaker": "A"},
+            {"text": "乙", "speaker": "A"},
+        ]
+        resp = self.client.post(
+            "/transcript-retime", json={"words": words, "revisions": revisions}
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_retime")
+        self.assertEqual(err["revision_start_index"], 1)
+        self.assertEqual(err["revision_end_index"], 2)
+        self.assertEqual(err["revision_word_count"], 2)
+        self.assertEqual(err["available_ms"], 1)
+        self.assertEqual(err["required_ms"], 2)
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_count_limits_and_schema(self):
+        # words / revisions 各 301 个均为 422；300 个恰好合法
+        big = [
+            {"start_ms": i * 10, "end_ms": i * 10 + 9, "text": "字", "speaker": "A"}
+            for i in range(301)
+        ]
+        revs = [{"text": "字", "speaker": "A"} for _ in range(301)]
+        resp = self.client.post("/transcript-retime", json={"words": big, "revisions": revs})
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+        words300 = [
+            {"start_ms": i * 10, "end_ms": i * 10 + 9, "text": "字", "speaker": "A"}
+            for i in range(300)
+        ]
+        resp = self.client.post(
+            "/transcript-retime",
+            json={"words": words300, "revisions": [{"text": "字", "speaker": "A"}]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["matched_count"], 1)
+
+        # 空 revisions、缺字段、空 text 均为 422
+        for payload in (
+            {"words": self.WORDS, "revisions": []},
+            {"words": self.WORDS, "revisions": [{"speaker": "A"}]},
+            {"words": self.WORDS, "revisions": [{"text": "", "speaker": "A"}]},
+            {"words": self.WORDS},
+        ):
+            resp = self.client.post("/transcript-retime", json=payload)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

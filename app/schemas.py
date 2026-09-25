@@ -305,3 +305,45 @@ class CrosstalkReportResponse(BaseModel):
     pair_overlaps: list[CrosstalkPairOverlapOut] = Field(
         ..., description="按说话人对排序的总重叠毫秒数；仅含 overlap_ms > 0 的对"
     )
+
+
+class TranscriptRetimeRequest(BaseModel):
+    words: list[WordIn] = Field(
+        ...,
+        min_length=1,
+        max_length=300,
+        description="原稿词序列（至多 300 词）：按时间排列且互不重叠，提供时间锚点",
+    )
+    revisions: list["TranscriptRevisionIn"] = Field(
+        ...,
+        min_length=1,
+        max_length=300,
+        description="修订词序列（至多 300 词）：每项含非空 text/speaker，无需时间",
+    )
+
+
+class TranscriptRevisionIn(BaseModel):
+    text: str = Field(..., min_length=1, description="修订词文本；按 (text, speaker) 与原稿匹配")
+    speaker: str = Field(..., min_length=1, description="修订词说话人；匹配时须与原稿一致")
+
+
+class TranscriptRetimeWordOut(BaseModel):
+    index: int
+    start_ms: int = Field(..., description="重定时后的词起始时间（毫秒）")
+    end_ms: int = Field(..., description="重定时后的词结束时间（毫秒，不早于 start_ms）")
+    text: str = Field(..., description="修订词文本（原样返回）")
+    speaker: str = Field(..., description="修订词说话人（原样返回）")
+    source_word_index: int | None = Field(
+        ...,
+        description="匹配到的原稿词序号（0-based），命中词沿用该原稿词的时间；"
+        "未匹配的修订词为 null（时间由相邻锚点间隔均分得出）",
+    )
+
+
+class TranscriptRetimeResponse(BaseModel):
+    words: list[TranscriptRetimeWordOut] = Field(
+        ..., description="按修订顺序返回的完整逐词时间"
+    )
+    matched_count: int = Field(
+        ..., description="保序匹配命中的词对数（未匹配词数为修订总数减去该值）"
+    )

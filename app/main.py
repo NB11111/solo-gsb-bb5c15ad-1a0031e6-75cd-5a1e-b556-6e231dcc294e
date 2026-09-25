@@ -2,7 +2,8 @@
 POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐、
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
 遮罩预览、POST /trailer-plan 预告片片段组合、POST /playback-plan 播放变速
-规划、POST /crosstalk-report 叠话统计报告服务。"""
+规划、POST /crosstalk-report 叠话统计报告、POST /transcript-retime 修订稿
+重新对齐逐词时间服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -34,11 +35,14 @@ from .schemas import (
     SpeakerReconcileResponse,
     TrailerPlanRequest,
     TrailerPlanResponse,
+    TranscriptRetimeRequest,
+    TranscriptRetimeResponse,
 )
 from .segmentation import optimal_segmentation
 from .speaker_reconcile import reconcile_speakers
 from .srt import render_srt
 from .trailer_plan import plan_trailer
+from .transcript_retime import retime_transcript
 
 app = FastAPI(
     title="Podcast Subtitle Segmentation API",
@@ -50,9 +54,11 @@ app = FastAPI(
     "在词区间不重叠与时长预算约束下组合必选说话人全覆盖的预告片片段，"
     "把连续同一说话人的词合并为语速块，在目标最长播放时长内选出"
     "总变速代价最小的语速方案，"
-    "并对允许乱序与交叠的词序列统计各说话人发声覆盖、"
-    "至少两人同时发声的叠话区间与各说话人对的总重叠毫秒数。",
-    version="1.8.0",
+    "对允许乱序与交叠的词序列统计各说话人发声覆盖、"
+    "至少两人同时发声的叠话区间与各说话人对的总重叠毫秒数，"
+    "并按 (text, speaker) 的最长保序匹配把修订稿锚定到原稿词时间轴、"
+    "为未匹配修订词在相邻锚点间隔内均分时间。",
+    version="1.9.0",
 )
 
 
@@ -83,7 +89,9 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "且 words 至多 2000 个；/trailer-plan 另需 1～20 个 candidates"
         "（每项含整数 start_word/end_word 与非负整数 score）、非负整数 "
         "budget_ms 与 1～3 个非空 required_speakers；/playback-plan 另需"
-        "非负整数 max_duration_ms；/crosstalk-report 的 words 至多 2000 个",
+        "非负整数 max_duration_ms；/crosstalk-report 的 words 至多 2000 个；"
+        "/transcript-retime 另需非空 revisions（每项含非空 text/speaker），"
+        "words 与 revisions 各不超过 300 个",
         {"errors": exc.errors()},
     )
 
@@ -194,3 +202,9 @@ async def create_crosstalk_report(request: CrosstalkReportRequest):
         segments=segments,
         pair_overlaps=pair_overlaps,
     )
+
+
+@app.post("/transcript-retime", response_model=TranscriptRetimeResponse)
+async def create_transcript_retime(request: TranscriptRetimeRequest):
+    words, matched_count = retime_transcript(request.words, request.revisions)
+    return TranscriptRetimeResponse(words=words, matched_count=matched_count)
