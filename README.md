@@ -9,9 +9,10 @@
 逐字替换为 `█` 并回报每处命中位置，**预告片片段组合**接口，在词区间
 互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合，
 **播放变速规划**接口，把连续同一说话人的词合并为语速块，在目标最长
-播放时长约束下选出总变速代价最小的语速方案，以及**叠话统计报告**接口，
+播放时长约束下选出总变速代价最小的语速方案，**叠话统计报告**接口，
 对允许乱序与交叠的词序列统计各说话人发声覆盖、至少两人同时发声的
-叠话区间与各说话人对的总重叠毫秒数。
+叠话区间与各说话人对的总重叠毫秒数，以及**修订稿重定时**接口，按
+`(text, speaker)` 的最大保序匹配为修订词重新生成逐词时间轴。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -32,6 +33,7 @@ docker compose up --build
 - 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
 - 播放变速规划接口：`POST http://localhost:8000/playback-plan`
 - 叠话统计报告接口：`POST http://localhost:8000/crosstalk-report`
+- 修订稿重定时接口：`POST http://localhost:8000/transcript-retime`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -870,13 +872,119 @@ curl -s http://localhost:8000/crosstalk-report \
   -d '{"words":[{"start_ms":1000,"end_ms":3000,"text":"没错","speaker":"A"},{"start_ms":0,"end_ms":2000,"text":"我觉得","speaker":"A"},{"start_ms":1500,"end_ms":2500,"text":"对对对","speaker":"B"},{"start_ms":4000,"end_ms":5000,"text":"下期再见","speaker":"B"}]}'
 ```
 
+## 修订稿重定时：`POST /transcript-retime`
+
+人工修订稿件（增、删、改词）后，依据原稿的逐词时间为**修订词**重新打时间轴。
+输入两侧词序列：原稿 `words`（字段与 `/segments` 相同：按时间排列、相邻不重叠，
+**1～300 词**）与修订词 `revisions`（只需非空 `text`/`speaker`，按修订顺序排列，
+**1～300 个**）。先在两侧之间按 `(text, speaker)` 求**最大数量的保序匹配**
+（说话人不同不算同一词），匹配数相同时取**匹配索引对序列字典序最小**者；
+已匹配修订词直接保留对应原词的 `start_ms`/`end_ms`，其余修订词按相邻锚点
+均分时间。
+
+服务地址：`POST http://localhost:8000/transcript-retime`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,   "end_ms": 100, "text": "开场白",   "speaker": "A"},
+    {"start_ms": 200, "end_ms": 300, "text": "欢迎收听", "speaker": "A"},
+    {"start_ms": 400, "end_ms": 500, "text": "再见",     "speaker": "B"},
+    {"start_ms": 600, "end_ms": 700, "text": "尾声",     "speaker": "B"}
+  ],
+  "revisions": [
+    {"text": "嗯",       "speaker": "A"},
+    {"text": "欢迎收听", "speaker": "A"},
+    {"text": "再见",     "speaker": "B"},
+    {"text": "拜拜",     "speaker": "B"},
+    {"text": "了",       "speaker": "B"}
+  ]
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `revisions` | 数组，1～300 个 | 修订词序列；每项含非空 `text` 与非空 `speaker`，**不带时间字段** |
+
+### 重定时规则
+
+1. **匹配**：以 `(text, speaker)` 为符号求最长公共子序列（两侧索引各自严格
+   递增的保序匹配），匹配数最大；同数时取匹配索引对序列
+   `((原词序号,修订词序号), ...)` **字典序最小**者（先比原词序号、再比修订词
+   序号）；
+2. **匹配词时间**：已匹配修订词保留对应原词的 `start_ms`/`end_ms`，响应中
+   `source_word_index` 为该原词序号（0-based）；未匹配词的
+   `source_word_index` 为 `null`；
+3. **未匹配连续段均分**：未匹配修订词按连续段（首条匹配之前、相邻匹配之间、
+   末条匹配之后）切分，每段在两侧锚点之间均分间隔——每词先得
+   `span // k` 毫秒，**余下毫秒从前往后逐个加 1**，因此每词至少 1ms 且段末
+   恰落在右锚点上；
+4. **虚拟锚点**：前缀段以**原稿首词 `start_ms`** 为左锚点、首条匹配原词的
+   `start_ms` 为右锚点；后缀段以末条匹配原词的 `end_ms` 为左锚点、
+   **原稿末词 `end_ms`** 为右锚点；**没有任何匹配时全部修订词作为一段，
+   均分原稿首词起点到末词终点的全长**；
+5. **间隔不足**：某段锚点间隔不足每词 1 毫秒（`span < k`）时返回 **422**
+   （`infeasible_transcript_retime`），并在 `revision_start_word` /
+   `revision_end_word` 中指出该段修订词范围（0-based、含端点），附
+   `word_count` 与 `available_ms`；
+6. 原稿沿用同一套词序与时间校验（空、倒序、重叠等 422 错误码一致）；
+   `words` 或 `revisions` 为空、超过 300 个、含空 `text`/`speaker` 均为
+   422（`invalid_request`）。
+
+### 响应示例（200）
+
+```json
+{
+  "words": [
+    {"index": 0, "start_ms": 0,   "end_ms": 200, "text": "嗯",       "speaker": "A", "source_word_index": null},
+    {"index": 1, "start_ms": 200, "end_ms": 300, "text": "欢迎收听", "speaker": "A", "source_word_index": 1},
+    {"index": 2, "start_ms": 400, "end_ms": 500, "text": "再见",     "speaker": "B", "source_word_index": 2},
+    {"index": 3, "start_ms": 500, "end_ms": 600, "text": "拜拜",     "speaker": "B", "source_word_index": null},
+    {"index": 4, "start_ms": 600, "end_ms": 700, "text": "了",       "speaker": "B", "source_word_index": null}
+  ],
+  "matched_word_count": 2
+}
+```
+
+> 上例“欢迎收听/A”“再见/B”与原稿词 1、2 匹配，保留原时间；修订词“嗯”在
+> 首条匹配之前，均分虚拟锚点 0→200（200ms 全给它）；“拜拜”“了”在末条匹配
+> 之后，均分 500→700 各得 100ms。被跳过的原稿词（“开场白”“尾声”）不占用
+> 修订时间轴。`words` 按修订顺序返回，`index` 即修订词序号（0-based）。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/transcript-retime \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":100,"text":"开场白","speaker":"A"},{"start_ms":200,"end_ms":300,"text":"欢迎收听","speaker":"A"},{"start_ms":400,"end_ms":500,"text":"再见","speaker":"B"},{"start_ms":600,"end_ms":700,"text":"尾声","speaker":"B"}],"revisions":[{"text":"嗯","speaker":"A"},{"text":"欢迎收听","speaker":"A"},{"text":"再见","speaker":"B"},{"text":"拜拜","speaker":"B"},{"text":"了","speaker":"B"}]}'
+```
+
+### 锚点间隔不足
+
+锚点间隔塞不下该段全部修订词（每词至少 1ms）时返回 422，并指出修订词范围：
+
+```json
+{
+  "error": {
+    "code": "infeasible_transcript_retime",
+    "message": "修订词第 1～101 个（共 101 词）的相邻锚点间隔仅 100 毫秒，不足每词至少 1 毫秒",
+    "revision_start_word": 1,
+    "revision_end_word": 101,
+    "word_count": 101,
+    "available_ms": 100
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负、`/transcript-retime` 的 `revisions` 为空/超过 300 个/含空 `text` 或 `speaker`、`/transcript-retime` 的 `words` 超过 300 个） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 中 `word_index` 为输入序） | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -892,6 +1000,7 @@ curl -s http://localhost:8000/crosstalk-report \
 | `infeasible_trailer_plan` | 不存在满足全部约束的预告片片段组合 | `candidate_count`、`budget_ms` |
 | `too_many_blocks` | 同一说话人连续块数超过 20 | `block_count` |
 | `infeasible_playback_plan` | 不存在满足目标最长播放时长约束的变速方案 | `block_count`、`max_duration_ms` |
+| `infeasible_transcript_retime` | 某段连续未匹配修订词的锚点间隔不足每词 1 毫秒 | `revision_start_word`、`revision_end_word`、`word_count`、`available_ms` |
 
 ### 无可行分段
 
@@ -1007,6 +1116,19 @@ E 为不同边界时刻数 ≤ 2n、M 为输出段数 ≤ E、k 为活跃说话�
 否则另起新段；说话人对重叠按输出段展开——每段时长计入其活跃集合的
 全部两人组合（三人同时发声的时长分别计入三对）。
 
+修订稿重定时（`transcript_retime.py`）为后向 LCS 长度 DP + 贪心重建，
+**O(n·m) 时间、O(n·m) 空间**（n、m ≤ 300）。以 `(text, speaker)` 为符号，
+`lcs[i][j]` 为原稿后缀 `[i,n)` 与修订词后缀 `[j,m)` 的最长公共子序列长度；
+两符号相等时取对角匹配，否则取“跳过原词/跳过修订词”两侧的较大值。
+字典序最小解无需在状态中保存整条序列：长度表建好后从状态 `(r,c)` 出发，
+按 i 升序、j 升序找第一个满足“符号相等且 `1 + lcs[i+1][j+1] == lcs[r][c]`”
+的索引对——跳过 `[r,i)`、`[c,j)` 总可做到，该条件又保证配上后后缀恰好
+补满最优长度，故它是某个最优匹配的最小首对；取定后推进到 `(i+1,j+1)`，
+归纳可得匹配索引对序列字典序最小。已匹配词保留原时间；未匹配词按
+前缀/中间/后缀连续段在相邻锚点（边缘使用原稿首词起点、末词终点两个
+虚拟锚点；无匹配时均分原稿全长）间均分，`span // k` 为每词毫秒、余数
+从前往后逐个加 1，间隔不足每词 1 毫秒即返回 422 并指出修订词范围。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -1037,6 +1159,7 @@ app/
   trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
   playback_plan.py      # 播放变速规划（纯标准库，复用同一套输入校验）
   crosstalk_report.py   # 叠话统计报告（纯标准库，允许乱序与交叠，仅校验词内时间）
+  transcript_retime.py  # 修订稿重定时：LCS 匹配 + 锚点均分（纯标准库）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -1049,6 +1172,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_trailer_plan.py
   test_playback_plan.py
   test_crosstalk_report.py
+  test_transcript_retime.py
   test_differential.py
   test_api.py
 Dockerfile
